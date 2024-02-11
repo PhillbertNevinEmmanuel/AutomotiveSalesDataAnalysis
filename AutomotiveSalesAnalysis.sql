@@ -806,15 +806,46 @@ We have a staggering retention rate of 98.8%!
 SELECT CUSTOMERNAME, MIN(ORDERDATE) AS first_order_date, MAX(ORDERDATE) AS last_order_date, DATEDIFF(DAY, MIN(ORDERDATE), MAX(ORDERDATE)) AS customer_tenure_days
 FROM AutomotiveSalesData.dbo.AutomotiveSalesData
 GROUP BY CUSTOMERNAME
-ORDER BY customer_tenure_days
+ORDER BY customer_tenure_days DESC
 
--- average of customer tenure days
+-- i want to create a customer tenure days column
+ALTER TABLE AutomotiveSalesData.dbo.AutomotiveSalesData
+ADD CUSTOMERTENUREDAYS INT
+
+UPDATE AutomotiveSalesData.dbo.AutomotiveSalesData
+SET CUSTOMERTENUREDAYS = DATEDIFF(DAY,(
+		SELECT MIN(ORDERDATE)
+		FROM AutomotiveSalesData.dbo.AutomotiveSalesData asd
+		WHERE asd.CUSTOMERNAME = AutomotiveSalesData.dbo.AutomotiveSalesData.CUSTOMERNAME
+	),(
+		SELECT MAX(ORDERDATE)
+		FROM AutomotiveSalesData.dbo.AutomotiveSalesData asd
+		WHERE asd.CUSTOMERNAME = AutomotiveSalesData.dbo.AutomotiveSalesData.CUSTOMERNAME
+	)
+)
+
+SELECT CUSTOMERNAME, MIN(ORDERDATE) AS first_order_date, MAX(ORDERDATE) AS last_order_date, CUSTOMERTENUREDAYS
+FROM AutomotiveSalesData.dbo.AutomotiveSalesData
+GROUP BY CUSTOMERNAME, CUSTOMERTENUREDAYS
+ORDER BY CUSTOMERTENUREDAYS DESC
+
+-- average of customer tenure days logic
+WITH CustomerTenure AS(
+	SELECT DATEDIFF(DAY, MIN(ORDERDATE), MAX(ORDERDATE)) AS customer_tenure_days
+	FROM AutomotiveSalesData.dbo.AutomotiveSalesData
+	GROUP BY CUSTOMERNAME
+)
+SELECT AVG(customer_tenure_days) as avg_customer_tenure_days
+FROM CustomerTenure
+
+-- let's try to calculate it using our new column
+WITH CustomerTenure AS(
+	SELECT CUSTOMERTENUREDAYS AS customer_tenure_days
+	FROM AutomotiveSalesData.dbo.AutomotiveSalesData
+	GROUP BY CUSTOMERNAME, CUSTOMERTENUREDAYS
+)
 SELECT AVG(customer_tenure_days) AS avg_customer_tenure_days
-FROM (
-    SELECT DATEDIFF(DAY, MIN(ORDERDATE), MAX(ORDERDATE)) AS customer_tenure_days
-    FROM AutomotiveSalesData.dbo.AutomotiveSalesData
-    GROUP BY CUSTOMERNAME
-) AS CustomerTenure
+FROM CustomerTenure
 
 -- I want to classify customers based on their dealsize
 SELECT CUSTOMERNAME, DEALSIZE, COUNT(ORDERNUMBER) AS order_count
@@ -925,9 +956,10 @@ SELECT * FROM AutomotiveSalesData.dbo.AutomotiveSalesData
 
 -- G. CUSTOMER LIFETIME VALUE (CLV) ANALYSIS
 -- I want to calculate the customer lifetime value analysis, the formula for customer lifetime value analysis is:
--- CLV=AVG(total_sales)*total_orders*(customer_tenure_days/365)
-WITH CustomerTotalSales AS (
-    SELECT CUSTOMERNAME, SUM(SALES) AS total_sales
+-- CLV=AVG(sales) AS APV * total_orders AS PF * AVG(customer_tenure_days)/365.0 AS CLS
+
+WITH CustomerAveragePurchaseValue AS (
+    SELECT CUSTOMERNAME, AVG(SALES) AS avg_purchase_value
     FROM AutomotiveSalesData.dbo.AutomotiveSalesData
 	WHERE STATUS = 'Shipped' OR STATUS = 'Resolved'
     GROUP BY CUSTOMERNAME
@@ -945,13 +977,56 @@ CustomerTenure AS (
     GROUP BY CUSTOMERNAME
 )
 SELECT
-	cts.CUSTOMERNAME,
-	AVG(cts.total_sales) AS avg_purchase_value,
+	capv.CUSTOMERNAME,
+	AVG(capv.avg_purchase_value) as avg_purchase_value,
 	co.total_orders AS purchase_frequency,
 	AVG(ct.customer_tenure_days) / 365.0 AS customer_lifespan_years,
-    ROUND(AVG(cts.total_sales) * co.total_orders * (AVG(ct.customer_tenure_days) / 365.0), 2) AS clv
-FROM CustomerTotalSales AS cts
-JOIN CustomerOrders AS co ON cts.CUSTOMERNAME = co.CUSTOMERNAME
-JOIN CustomerTenure AS ct ON cts.CUSTOMERNAME = ct.CUSTOMERNAME
-GROUP BY cts.CUSTOMERNAME, co.total_orders
+    ROUND(AVG(capv.avg_purchase_value) * co.total_orders * (AVG(ct.customer_tenure_days) / 365.0), 2) AS clv
+FROM CustomerAveragePurchaseValue AS capv
+JOIN CustomerOrders AS co ON capv.CUSTOMERNAME = co.CUSTOMERNAME
+JOIN CustomerTenure AS ct ON capv.CUSTOMERNAME = ct.CUSTOMERNAME
+GROUP BY capv.CUSTOMERNAME, co.total_orders
 ORDER BY clv DESC
+
+-- now that we have the right customer lifetime analysis formula, let's insert it into a new column called clv
+
+ALTER TABLE AutomotiveSalesData.dbo.AutomotiveSalesData
+ADD CUSTOMERLIFETIMEVALUE FLOAT
+
+WITH CustomerAveragePurchaseValue AS (
+    SELECT CUSTOMERNAME, AVG(SALES) AS avg_purchase_value
+    FROM AutomotiveSalesData.dbo.AutomotiveSalesData
+	WHERE STATUS = 'Shipped' OR STATUS = 'Resolved'
+    GROUP BY CUSTOMERNAME
+),
+CustomerOrders AS (
+    SELECT CUSTOMERNAME, COUNT(ORDERNUMBER) AS total_orders
+    FROM AutomotiveSalesData.dbo.AutomotiveSalesData
+	WHERE STATUS = 'Shipped' OR STATUS = 'Resolved'
+    GROUP BY CUSTOMERNAME
+),
+CustomerTenure AS (
+    SELECT CUSTOMERNAME, DATEDIFF(DAY, MIN(ORDERDATE), MAX(ORDERDATE)) AS customer_tenure_days
+    FROM AutomotiveSalesData.dbo.AutomotiveSalesData
+	WHERE STATUS = 'Shipped' OR STATUS = 'Resolved'
+    GROUP BY CUSTOMERNAME
+),
+CLV AS(
+	SELECT capv.CUSTOMERNAME,
+	AVG(capv.avg_purchase_value) AS avg_purchase_value,
+	co.total_orders AS purchase_frequency,
+	AVG(ct.customer_tenure_days) / 365.0 AS customer_lifespan_years
+	FROM CustomerAveragePurchaseValue AS capv
+	JOIN CustomerOrders co ON capv.CUSTOMERNAME = co.CUSTOMERNAME
+	JOIN CustomerTenure ct ON capv.CUSTOMERNAME = ct.CUSTOMERNAME
+	GROUP BY capv.CUSTOMERNAME, co.total_orders
+)
+UPDATE asd
+SET asd.CUSTOMERLIFETIMEVALUE  = ROUND(clv.avg_purchase_value * clv.purchase_frequency * (clv.customer_lifespan_years), 2)
+FROM AutomotiveSalesData asd
+JOIN CLV clv ON asd.CUSTOMERNAME = clv.CUSTOMERNAME
+
+-- let's check our whole data and the count distinct of customername and customer lifetimevalue
+SELECT COUNT(DISTINCT CUSTOMERNAME) as count_customername, COUNT(DISTINCT CUSTOMERLIFETIMEVALUE) count_clv FROM AutomotiveSalesData.dbo.AutomotiveSalesData
+
+SELECT * FROM AutomotiveSalesData.dbo.AutomotiveSalesData
